@@ -18,11 +18,13 @@ use irondash_run_loop::{
     RunLoop,
 };
 use objc2_foundation::{
-    NSArray, NSCopying, NSData, NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions,
-    NSItemProvider, NSPropertyListReadOptions, NSPropertyListSerialization, NSString, NSURL,
+    NSArray, NSCopying, NSData, NSDictionary, NSError, NSFileCoordinator,
+    NSFileCoordinatorReadingOptions, NSItemProvider, NSObjectProtocol, NSPropertyListReadOptions,
+    NSPropertyListSerialization, NSString, NSURL,
 };
 
 use objc2::{
+    msg_send,
     rc::{autoreleasepool, Id},
     runtime::{Bool, NSObject},
     ClassType,
@@ -253,22 +255,51 @@ impl PlatformDataReader {
         let completer = Arc::new(Mutex::new(Capsule::new(completer)));
         let provider = providers[item as usize].clone();
 
-        // Some providers (e.g. iPadOS Photos drag items) fail the in-place
-        // load while still providing the file as a temporary copy, so the
-        // plain file representation load is kept as a fallback.
-        let fallback_block = RcBlock::new({
+        // Stage 4: generic item load. Some providers (e.g. iPadOS Photos
+        // drag items) refuse every typed file/data load but still serve the
+        // item itself as NSData / NSURL.
+        enum ReaderPayload {
+            File(FileWithBackgroundCoordinator),
+            Bytes(Vec<u8>),
+        }
+        let load_item_block = RcBlock::new({
             let completer = completer.clone();
             let sender = RunLoop::current().new_sender();
-            move |url: *mut NSURL, error: *mut NSError| {
-                let url = unsafe { Id::retain(url) };
+            move |object: *mut NSObject, error: *mut NSError| {
+                let object = unsafe { Id::retain(object) };
                 let error = unsafe { Id::retain(error) };
-                let res = match (url, error) {
-                    (Some(url), _) => FileWithBackgroundCoordinator::new(&url),
+                let res = match (object, error) {
+                    (Some(object), _) => {
+                        let class_name = unsafe { object.class().name().to_string() };
+                        if object.is_kind_of::<NSData>() {
+                            let data: Id<NSData> = unsafe { Id::cast(object) };
+                            let bytes = unsafe { data.bytes() }.to_vec();
+                            if bytes.is_empty() {
+                                Err(NativeExtensionsError::VirtualFileReceiveError(format!(
+                                    "loadItem returned empty NSData ({class_name})"
+                                )))
+                            } else {
+                                Ok(ReaderPayload::Bytes(bytes))
+                            }
+                        } else if object.is_kind_of::<NSURL>() {
+                            let url: Id<NSURL> = unsafe { Id::cast(object) };
+                            FileWithBackgroundCoordinator::new(&url).map(ReaderPayload::File)
+                        } else {
+                            Err(NativeExtensionsError::VirtualFileReceiveError(format!(
+                                "loadItem returned {class_name}"
+                            )))
+                        }
+                    }
                     (_, Some(error)) => Err(NativeExtensionsError::VirtualFileReceiveError(
-                        error.localizedDescription().to_string(),
+                        format!(
+                            "loadItem failed: {} (code {} {})",
+                            unsafe { error.localizedDescription().to_string() },
+                            unsafe { error.code() },
+                            unsafe { error.domain().to_string() },
+                        ),
                     )),
                     (_, _) => Err(NativeExtensionsError::VirtualFileReceiveError(
-                        "Unknown error".into(),
+                        "loadItem returned no item".into(),
                     )),
                 };
                 let completer = completer.clone();
@@ -278,9 +309,112 @@ impl PlatformDataReader {
                         .unwrap()
                         .take()
                         .expect("Block invoked more than once");
-                    let res = res.map(|f| Some(Rc::new(f) as Rc<dyn VirtualFileReader>));
+                    let res = res.map(|payload| {
+                        Some(match payload {
+                            ReaderPayload::File(f) => Rc::new(f) as Rc<dyn VirtualFileReader>,
+                            ReaderPayload::Bytes(bytes) => Rc::new(BytesVirtualFileReader {
+                                bytes: RefCell::new(Some(bytes)),
+                                file_name: None,
+                            }) as Rc<dyn VirtualFileReader>,
+                        })
+                    });
                     completer.complete(res);
                 });
+            }
+        });
+
+        // Stage 3: in-memory data load. bplist payloads are reported as
+        // diagnostics instead of being served as image bytes.
+        let data_block = RcBlock::new({
+            let completer = completer.clone();
+            let sender = RunLoop::current().new_sender();
+            let load_item_block = load_item_block.clone();
+            let provider = provider.clone();
+            let format = format.to_string();
+            move |data: *mut NSData, error: *mut NSError| {
+                let data = unsafe { Id::retain(data) };
+                let error = unsafe { Id::retain(error) };
+                if let Some(data) = data.filter(|d| unsafe { d.len() } > 0) {
+                    let bytes = unsafe { data.bytes() }.to_vec();
+                    let res = if bytes.starts_with(b"bplist00") {
+                        let decoded = unsafe { Self::maybe_decode_bplist(&data) };
+                        let description_nsstring: Id<NSString> =
+                            unsafe { Id::cast(decoded.debugDescription()) };
+                        let description = description_nsstring.to_string();
+                        Err(NativeExtensionsError::VirtualFileReceiveError(format!(
+                            "data load returned plist: {description}"
+                        )))
+                    } else {
+                        Ok(ReaderPayload::Bytes(bytes))
+                    };
+                    let completer = completer.clone();
+                    sender.send(move || {
+                        let completer = completer
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .expect("Block invoked more than once");
+                        let res = res.map(|payload| {
+                            Some(match payload {
+                                ReaderPayload::File(f) => Rc::new(f) as Rc<dyn VirtualFileReader>,
+                                ReaderPayload::Bytes(bytes) => Rc::new(BytesVirtualFileReader {
+                                    bytes: RefCell::new(Some(bytes)),
+                                    file_name: None,
+                                }) as Rc<dyn VirtualFileReader>,
+                            })
+                        });
+                        completer.complete(res);
+                    });
+                } else {
+                    let _ = &error;
+                    let type_identifier = NSString::from_str(&format);
+                    let () = unsafe {
+                        msg_send![
+                            &*provider,
+                            loadItemForTypeIdentifier: &*type_identifier,
+                            options: Option::<&NSDictionary>::None,
+                            completionHandler: &*load_item_block,
+                        ]
+                    };
+                }
+            }
+        });
+
+        // Stage 2: plain file representation load as a temporary copy.
+        let fallback_block = RcBlock::new({
+            let completer = completer.clone();
+            let sender = RunLoop::current().new_sender();
+            let data_block = data_block.clone();
+            let provider = provider.clone();
+            let format = format.to_string();
+            move |url: *mut NSURL, error: *mut NSError| {
+                let url = unsafe { Id::retain(url) };
+                let error = unsafe { Id::retain(error) };
+                match url {
+                    Some(url) => {
+                        let res = FileWithBackgroundCoordinator::new(&url);
+                        let completer = completer.clone();
+                        sender.send(move || {
+                            let completer = completer
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .expect("Block invoked more than once");
+                            let res = res.map(|f| Some(Rc::new(f) as Rc<dyn VirtualFileReader>));
+                            completer.complete(res);
+                        });
+                    }
+                    None => {
+                        let _ = &error;
+                        let ns_progress = unsafe {
+                            provider.loadDataRepresentationForTypeIdentifier_completionHandler(
+                                &NSString::from_str(&format),
+                                &data_block,
+                            )
+                        };
+                        let _ = ns_progress;
+                    }
+                }
             }
         });
 
@@ -458,6 +592,31 @@ impl FileWithBackgroundCoordinator {
 impl Drop for FileWithBackgroundCoordinator {
     fn drop(&mut self) {
         self.close().ok();
+    }
+}
+
+struct BytesVirtualFileReader {
+    bytes: RefCell<Option<Vec<u8>>>,
+    file_name: Option<String>,
+}
+
+#[async_trait(?Send)]
+impl VirtualFileReader for BytesVirtualFileReader {
+    async fn read_next(&self) -> NativeExtensionsResult<Vec<u8>> {
+        let mut bytes = self.bytes.borrow_mut();
+        Ok(bytes.take().unwrap_or_default())
+    }
+
+    fn file_size(&self) -> NativeExtensionsResult<Option<i64>> {
+        Ok(Some(self.bytes.borrow().as_ref().map_or(0, |b| b.len() as i64)))
+    }
+
+    fn file_name(&self) -> Option<String> {
+        self.file_name.clone()
+    }
+
+    fn close(&self) -> NativeExtensionsResult<()> {
+        Ok(())
     }
 }
 
