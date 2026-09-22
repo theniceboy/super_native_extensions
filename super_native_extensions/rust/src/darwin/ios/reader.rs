@@ -205,12 +205,14 @@ impl PlatformDataReader {
     ) -> NativeExtensionsResult<bool> {
         // All data on iOS can be received as a virtual file through
         // load(InPlace)FileRepresentationForTypeIdentifier so we add a bit of heuristics
-        // to avoid creating a potential temporary file for text, composite content, images
+        // to avoid creating a potential temporary file for text, composite content
         // and URLS. The assumption here is that they are small enough to be
         // to be all loaded in memory.
+        // Images are excluded from the heuristic: on iPadOS (26) drag items
+        // from Photos only materialize through file representations and
+        // loadDataRepresentation returns empty data for them.
         if uti_conforms_to(format, "public.composite-content")
             || uti_conforms_to(format, "public.text")
-            || uti_conforms_to(format, "public.image")
             || uti_conforms_to(format, "public.url")
             || uti_conforms_to(format, "com.apple.property-list")
         {
