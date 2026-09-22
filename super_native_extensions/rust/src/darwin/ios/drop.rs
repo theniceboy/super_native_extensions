@@ -183,7 +183,16 @@ impl Session {
             }),
         );
 
-        let operation: UIDropOperation = self.last_operation.get().to_platform();
+        // The Dart reply arrives asynchronously, so the proposal below is
+        // the answer to a previous update. Answering Cancel on the first
+        // update (the unset state) makes promise-based sources (e.g.
+        // Photos) tear down their item providers, after which every load
+        // fails with NSItemProviderUnknownError (-1000). Stay optimistic
+        // until Dart has answered.
+        let operation: UIDropOperation = match self.last_operation.get() {
+            DropOperation::None => UIDropOperation::Copy,
+            other => other.to_platform(),
+        };
 
         let proposal = unsafe {
             UIDropProposal::initWithDropOperation(self.mtm.alloc::<UIDropProposal>(), operation)
