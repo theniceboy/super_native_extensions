@@ -1,11 +1,12 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
     fs::{self, File},
     io::Read,
     path::PathBuf,
     ptr::NonNull,
     rc::{Rc, Weak},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
 };
 
@@ -45,6 +46,84 @@ use crate::{
 
 pub struct PlatformDataReader {
     source: ReaderSource,
+}
+
+pub enum EagerOutcome {
+    Bytes(Vec<u8>, String),
+    Failed(String),
+}
+
+static EAGER_ITEM_DATA: OnceLock<Mutex<HashMap<usize, EagerOutcome>>> = OnceLock::new();
+
+fn eager_item_data() -> &'static Mutex<HashMap<usize, EagerOutcome>> {
+    EAGER_ITEM_DATA.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Loads every dropped item's registered representations directly at
+/// performDrop entry, before any plugin machinery runs, and stashes the
+/// first payload per item provider. Serves as both the working read path
+/// for providers that only materialize at drop time and the diagnostic
+/// that proves whether loads can work at all in this app context.
+fn eager_load_session_items(items: &Id<NSArray<UIDragItem>>) {
+    eager_item_data().lock().unwrap().clear();
+    for item in items.iter() {
+        let provider = unsafe { item.itemProvider() };
+        let key = (&*provider as *const NSItemProvider as *const () as usize);
+        let registered = unsafe { provider.registeredTypeIdentifiers() };
+        for format in registered.iter() {
+            let format = format.to_string();
+            let type_identifier = NSString::from_str(&format);
+            let sender = RunLoop::current().new_sender();
+            let block = RcBlock::new(move |url: *mut NSURL, error: *mut NSError| {
+                let url = unsafe { Id::retain(url) };
+                let error = unsafe { Id::retain(error) };
+                let key = key;
+                let outcome = match (url, error) {
+                    (Some(url), _) => {
+                        let path = path_from_url(&url);
+                        match path.file_name().map(|n| n.to_string_lossy().into_owned()) {
+                            Some(file_name) => match fs::read(&path) {
+                                Ok(bytes) => EagerOutcome::Bytes(bytes, file_name),
+                                Err(err) => {
+                                    EagerOutcome::Failed(format!("eager read failed: {err}"))
+                                }
+                            },
+                            None => EagerOutcome::Failed("eager load: no file name".into()),
+                        }
+                    }
+                    (_, Some(error)) => EagerOutcome::Failed(format!(
+                        "eager load: {} (code {} {})",
+                        unsafe { error.localizedDescription().to_string() },
+                        unsafe { error.code() },
+                        unsafe { error.domain().to_string() },
+                    )),
+                    (_, _) => EagerOutcome::Failed("eager load: no url".into()),
+                };
+                sender.send(move || {
+                    let mut stash = eager_item_data().lock().unwrap();
+                    stash.entry(key).or_insert(outcome);
+                });
+            });
+            let ns_progress = unsafe {
+                provider.loadFileRepresentationForTypeIdentifier_completionHandler(
+                    &type_identifier,
+                    &block,
+                )
+            };
+            let _ = ns_progress;
+        }
+    }
+}
+
+fn eager_outcome_for_provider(provider: &NSItemProvider) -> Option<EagerOutcome> {
+    let key = (provider as *const NSItemProvider as *const () as usize);
+    let stash = eager_item_data().lock().unwrap();
+    stash.get(&key).map(|outcome| match outcome {
+        EagerOutcome::Bytes(bytes, name) => {
+            EagerOutcome::Bytes(bytes.clone(), name.clone())
+        }
+        EagerOutcome::Failed(msg) => EagerOutcome::Failed(msg.clone()),
+    })
 }
 
 enum ReaderSource {
@@ -186,8 +265,9 @@ impl PlatformDataReader {
         items: Id<NSArray<UIDragItem>>,
     ) -> NativeExtensionsResult<Rc<Self>> {
         let res = Rc::new(Self {
-            source: ReaderSource::DropSessionItems(items),
+            source: ReaderSource::DropSessionItems(items.clone()),
         });
+        eager_load_session_items(&items);
         res.assign_weak_self(Rc::downgrade(&res));
         Ok(res)
     }
@@ -248,6 +328,23 @@ impl PlatformDataReader {
         let providers = self.get_items_providers();
         if item >= providers.len() as i64 {
             return Err(NativeExtensionsError::OtherError("Invalid item".into()));
+        }
+        if let Some(outcome) = eager_outcome_for_provider(&providers[item as usize]) {
+            match outcome {
+                EagerOutcome::Bytes(bytes, name) => {
+                    return Ok(Some(
+                        Rc::new(BytesVirtualFileReader {
+                            bytes: RefCell::new(Some(bytes)),
+                            file_name: Some(name),
+                        }) as Rc<dyn VirtualFileReader>,
+                    ));
+                }
+                EagerOutcome::Failed(msg) => {
+                    return Err(NativeExtensionsError::VirtualFileReceiveError(format!(
+                        "{msg} (eager load at performDrop entry failed; provider will not serve)"
+                    )));
+                }
+            }
         }
         let (future, completer) = FutureCompleter::new();
 
