@@ -251,10 +251,15 @@ impl PlatformDataReader {
 
         // travels between threads, must be refcounted because block is Fn
         let completer = Arc::new(Mutex::new(Capsule::new(completer)));
-        let provider = &providers[item as usize];
-        let sender = RunLoop::current().new_sender();
-        let block = RcBlock::new(
-            move |url: *mut NSURL, _is_in_place: Bool, error: *mut NSError| {
+        let provider = providers[item as usize].clone();
+
+        // Some providers (e.g. iPadOS Photos drag items) fail the in-place
+        // load while still providing the file as a temporary copy, so the
+        // plain file representation load is kept as a fallback.
+        let fallback_block = RcBlock::new({
+            let completer = completer.clone();
+            let sender = RunLoop::current().new_sender();
+            move |url: *mut NSURL, error: *mut NSError| {
                 let url = unsafe { Id::retain(url) };
                 let error = unsafe { Id::retain(error) };
                 let res = match (url, error) {
@@ -273,12 +278,46 @@ impl PlatformDataReader {
                         .unwrap()
                         .take()
                         .expect("Block invoked more than once");
-                    // completer.complete(res);
-                    let res = res.map::<Option<Rc<dyn VirtualFileReader>>, _>(|f| Some(Rc::new(f)));
+                    let res = res.map(|f| Some(Rc::new(f) as Rc<dyn VirtualFileReader>));
                     completer.complete(res);
                 });
-            },
-        );
+            }
+        });
+
+        let block = RcBlock::new({
+            let completer = completer.clone();
+            let sender = RunLoop::current().new_sender();
+            let fallback_block = fallback_block.clone();
+            let provider = provider.clone();
+            let format = format.to_string();
+            let read_progress = read_progress.clone();
+            move |url: *mut NSURL, _is_in_place: Bool, error: *mut NSError| {
+                let url = unsafe { Id::retain(url) };
+                let error = unsafe { Id::retain(error) };
+                let _ = error;
+                if let Some(url) = url {
+                    let res = FileWithBackgroundCoordinator::new(&url);
+                    let completer = completer.clone();
+                    sender.send(move || {
+                        let completer = completer
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .expect("Block invoked more than once");
+                        let res = res.map(|f| Some(Rc::new(f) as Rc<dyn VirtualFileReader>));
+                        completer.complete(res);
+                    });
+                } else {
+                    let ns_progress = unsafe {
+                        provider.loadFileRepresentationForTypeIdentifier_completionHandler(
+                            &NSString::from_str(&format),
+                            &fallback_block,
+                        )
+                    };
+                    bridge_progress(ns_progress, read_progress.clone());
+                }
+            }
+        });
         let ns_progress = unsafe {
             provider.loadInPlaceFileRepresentationForTypeIdentifier_completionHandler(
                 &NSString::from_str(format),
